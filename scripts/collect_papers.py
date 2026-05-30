@@ -318,6 +318,13 @@ def arxiv_query_for_topic(topic: Topic) -> str:
     return " AND ".join(parts) if parts else f'all:"{topic.name}"'
 
 
+def arxiv_category_query_for_topic(topic: Topic) -> str:
+    category_terms = [f"cat:{category}" for category in topic.arxiv_categories[:5]]
+    if category_terms:
+        return "(" + " OR ".join(category_terms) + ")"
+    return arxiv_query_for_topic(topic)
+
+
 def topic_text_query(topic: Topic, limit: int = 6) -> str:
     terms = topic.keywords[:limit] or [topic.name]
     return " OR ".join(terms)
@@ -490,6 +497,19 @@ def fetch_arxiv(topic: Topic, max_results: int) -> list[dict[str, Any]]:
         sort_order="descending",
         label=topic.name,
     )
+    if env_flag("ARXIV_EXPAND_CATEGORY_SEARCH", True) and topic.arxiv_categories:
+        in_topic_delay = float(os.getenv("ARXIV_IN_TOPIC_DELAY_SECONDS", "3"))
+        if in_topic_delay > 0:
+            time.sleep(in_topic_delay)
+        category_max_results = max(1, int(os.getenv("ARXIV_CATEGORY_MAX_RESULTS", str(max_results))))
+        category_papers = fetch_arxiv_query(
+            arxiv_category_query_for_topic(topic),
+            category_max_results,
+            sort_by="submittedDate",
+            sort_order="descending",
+            label=f"{topic.name} categories",
+        )
+        papers = dedupe_papers([*papers, *category_papers])
     for paper in papers:
         paper["seed_topic"] = topic.id
     return papers
@@ -534,22 +554,203 @@ def find_arxiv_by_title(title: str, max_results: int = 5) -> dict[str, Any] | No
     return None
 
 
+def semantic_scholar_paper_from_item(item: dict[str, Any]) -> dict[str, Any] | None:
+    paper_id = str(item.get("paperId") or "")
+    title = normalize_space(str(item.get("title") or ""))
+    if not paper_id or not title:
+        return None
+    authors = [str(author.get("name") or "") for author in item.get("authors", [])[:12]]
+    categories = [str(value) for value in item.get("fieldsOfStudy", []) if value]
+    venue = str(item.get("venue") or "")
+    if venue:
+        categories.append(venue)
+    pdf_url = str((item.get("openAccessPdf") or {}).get("url") or "")
+    return {
+        "id": f"s2:{paper_id}",
+        "source": "Semantic Scholar",
+        "title": title,
+        "authors": [author for author in authors if author],
+        "summary": normalize_space(str(item.get("abstract") or "")),
+        "published": date_to_iso(item.get("publicationDate") or item.get("year")),
+        "updated": "",
+        "paper_url": str(item.get("url") or f"https://www.semanticscholar.org/paper/{paper_id}"),
+        "pdf_url": pdf_url,
+        "categories": categories[:8],
+    }
+
+
+def find_semantic_scholar_by_title(title: str, max_results: int = 5) -> dict[str, Any] | None:
+    params = {
+        "query": title,
+        "limit": str(min(max(1, max_results), 100)),
+        "fields": "paperId,title,abstract,authors,year,publicationDate,url,openAccessPdf,venue,externalIds,fieldsOfStudy",
+    }
+    headers = {"User-Agent": "paper-daily-collector/1.0"}
+    api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
+    if api_key:
+        headers["x-api-key"] = api_key
+    url = f"{SEMANTIC_SCHOLAR_SEARCH_URL}?{urllib.parse.urlencode(params)}"
+    data = request_json(url, headers=headers, timeout=float(os.getenv("SEMANTIC_SCHOLAR_TIMEOUT_SECONDS", "60")))
+    for item in data.get("data", []):
+        candidate = semantic_scholar_paper_from_item(item)
+        if candidate and titles_match(title, candidate["title"]) and has_meaningful_summary(candidate):
+            return candidate
+    return None
+
+
+def openalex_paper_from_work(work: dict[str, Any], source_name: str = "OpenAlex") -> dict[str, Any] | None:
+    title = normalize_space(str(work.get("title") or ""))
+    work_id = str(work.get("id") or work.get("doi") or title)
+    if not title or not work_id:
+        return None
+    locations = work.get("locations") or []
+    primary = work.get("primary_location") or {}
+    best_oa = work.get("best_oa_location") or {}
+    pdf_url = (
+        primary.get("pdf_url")
+        or best_oa.get("pdf_url")
+        or next((location.get("pdf_url") for location in locations if location.get("pdf_url")), "")
+    )
+    authors = [
+        str((authorship.get("author") or {}).get("display_name") or "")
+        for authorship in work.get("authorships", [])
+    ]
+    concepts = [
+        str(concept.get("display_name") or "")
+        for concept in work.get("concepts", [])[:8]
+        if concept.get("display_name")
+    ]
+    return {
+        "id": f"openalex:{work_id.rsplit('/', 1)[-1]}",
+        "source": source_name,
+        "title": title,
+        "authors": [author for author in authors if author],
+        "summary": normalize_space(openalex_abstract_text(work)),
+        "published": date_to_iso(work.get("publication_date") or work.get("publication_year")),
+        "updated": "",
+        "paper_url": str(work.get("doi") or work.get("id") or ""),
+        "pdf_url": str(pdf_url or ""),
+        "categories": concepts,
+    }
+
+
+def find_openalex_by_title(title: str, max_results: int = 5) -> dict[str, Any] | None:
+    params = {
+        "search": title,
+        "per-page": str(min(max(1, max_results), 25)),
+    }
+    mailto = os.getenv("CONTACT_EMAIL") or os.getenv("OPENALEX_EMAIL")
+    if mailto:
+        params["mailto"] = mailto
+    url = f"{OPENALEX_WORKS_URL}?{urllib.parse.urlencode(params)}"
+    data = request_json(url, timeout=float(os.getenv("OPENALEX_TIMEOUT_SECONDS", "60")))
+    for work in data.get("results", []):
+        candidate = openalex_paper_from_work(work)
+        if candidate and titles_match(title, candidate["title"]) and has_meaningful_summary(candidate):
+            return candidate
+    return None
+
+
+def crossref_paper_from_item(item: dict[str, Any], source_name: str = "Crossref") -> dict[str, Any] | None:
+    title = normalize_space(" ".join(str(part) for part in item.get("title", []) if part))
+    doi = str(item.get("DOI") or "")
+    paper_url = str(item.get("URL") or (f"https://doi.org/{doi}" if doi else ""))
+    if not title or not (doi or paper_url):
+        return None
+    authors = []
+    for author in item.get("author", [])[:12]:
+        name = normalize_space(f"{author.get('given', '')} {author.get('family', '')}")
+        if name:
+            authors.append(name)
+    pdf_url = ""
+    for link in item.get("link", []):
+        if "pdf" in str(link.get("content-type", "")).lower() and link.get("URL"):
+            pdf_url = str(link.get("URL"))
+            break
+    return {
+        "id": f"crossref:{doi or slugify(title)}",
+        "source": source_name,
+        "title": title,
+        "authors": authors,
+        "summary": html_to_text(str(item.get("abstract") or "")),
+        "published": crossref_date(item),
+        "updated": "",
+        "paper_url": paper_url,
+        "pdf_url": pdf_url,
+        "categories": [str(subject) for subject in item.get("subject", [])[:8]],
+    }
+
+
+def find_crossref_by_title(title: str, max_results: int = 5) -> dict[str, Any] | None:
+    params = {
+        "query.title": title,
+        "rows": str(min(max(1, max_results), 20)),
+        "sort": "score",
+        "order": "desc",
+    }
+    mailto = os.getenv("CONTACT_EMAIL") or os.getenv("CROSSREF_EMAIL")
+    if mailto:
+        params["mailto"] = mailto
+    headers = {"User-Agent": f"paper-daily-collector/1.0 (mailto:{mailto or 'unknown@example.com'})"}
+    url = f"{CROSSREF_WORKS_URL}?{urllib.parse.urlencode(params)}"
+    data = request_json(url, headers=headers, timeout=float(os.getenv("CROSSREF_TIMEOUT_SECONDS", "60")))
+    for item in (data.get("message") or {}).get("items", []):
+        candidate = crossref_paper_from_item(item)
+        if candidate and titles_match(title, candidate["title"]) and has_meaningful_summary(candidate):
+            return candidate
+    return None
+
+
+def find_conference_abstract_by_title(title: str, max_results: int = 5) -> dict[str, Any] | None:
+    finders = {
+        "arxiv": find_arxiv_by_title,
+        "semantic_scholar": find_semantic_scholar_by_title,
+        "semanticscholar": find_semantic_scholar_by_title,
+        "openalex": find_openalex_by_title,
+        "crossref": find_crossref_by_title,
+    }
+    for source_type in env_list("CONFERENCE_ABSTRACT_SOURCES", ["arxiv", "semantic_scholar", "openalex", "crossref"]):
+        finder = finders.get(source_type.strip().lower())
+        if not finder:
+            continue
+        try:
+            candidate = finder(title, max_results=max_results)
+        except Exception as exc:
+            print(f"Warning: {source_type} title enrichment failed for {title[:80]}: {exc}", file=sys.stderr)
+            continue
+        if candidate and has_meaningful_summary(candidate):
+            return candidate
+    return None
+
+
 def enrich_conference_paper_from_arxiv(paper: dict[str, Any], arxiv_paper: dict[str, Any]) -> bool:
-    if not has_meaningful_summary(arxiv_paper):
+    return enrich_conference_paper_from_candidate(paper, arxiv_paper, "arXiv")
+
+
+def enrich_conference_paper_from_candidate(
+    paper: dict[str, Any],
+    candidate: dict[str, Any],
+    abstract_source: str | None = None,
+) -> bool:
+    if not has_meaningful_summary(candidate):
         return False
-    paper["summary"] = arxiv_paper["summary"]
-    paper["abstract_source"] = "arXiv"
+    source = abstract_source or str(candidate.get("source") or "external")
+    paper["summary"] = candidate["summary"]
+    paper["abstract_source"] = source
     paper["enriched"] = True
-    paper["arxiv_id"] = arxiv_paper.get("id", "")
-    paper["arxiv_url"] = arxiv_paper.get("paper_url", "")
-    paper["source"] = f"{paper.get('source', 'DBLP')} + arXiv"
-    if arxiv_paper.get("paper_url"):
-        paper["paper_url"] = arxiv_paper["paper_url"]
-    if arxiv_paper.get("pdf_url"):
-        paper["pdf_url"] = arxiv_paper["pdf_url"]
-    if arxiv_paper.get("authors"):
-        paper["authors"] = arxiv_paper["authors"]
-    categories = list(dict.fromkeys([*paper.get("categories", []), *arxiv_paper.get("categories", [])]))
+    paper["abstract_source_id"] = candidate.get("id", "")
+    paper["abstract_source_url"] = candidate.get("paper_url", "")
+    if source.lower() == "arxiv":
+        paper["arxiv_id"] = candidate.get("id", "")
+        paper["arxiv_url"] = candidate.get("paper_url", "")
+    paper["source"] = f"{paper.get('source', 'DBLP')} + {source}"
+    if candidate.get("paper_url"):
+        paper["paper_url"] = candidate["paper_url"]
+    if candidate.get("pdf_url"):
+        paper["pdf_url"] = candidate["pdf_url"]
+    if candidate.get("authors"):
+        paper["authors"] = candidate["authors"]
+    categories = list(dict.fromkeys([*paper.get("categories", []), *candidate.get("categories", [])]))
     paper["categories"] = [category for category in categories if category]
     return True
 
@@ -1239,10 +1440,25 @@ def is_relevant_enough(paper: dict[str, Any], best_match: dict[str, Any]) -> boo
 
 
 def enrich_conference_papers_from_arxiv(papers: list[dict[str, Any]]) -> dict[str, Any]:
-    max_enrichments = max(0, int(os.getenv("MAX_CONFERENCE_ARXIV_ENRICHMENTS", "50")))
-    delay_seconds = float(os.getenv("CONFERENCE_ARXIV_DELAY_SECONDS", "3"))
-    search_results = max(1, int(os.getenv("CONFERENCE_ARXIV_SEARCH_RESULTS", "5")))
+    max_enrichments = max(
+        0,
+        int(os.getenv("MAX_CONFERENCE_ABSTRACT_ENRICHMENTS", os.getenv("MAX_CONFERENCE_ARXIV_ENRICHMENTS", "50"))),
+    )
+    delay_seconds = float(os.getenv("CONFERENCE_ABSTRACT_DELAY_SECONDS", os.getenv("CONFERENCE_ARXIV_DELAY_SECONDS", "3")))
+    search_results = max(
+        1,
+        int(os.getenv("CONFERENCE_ABSTRACT_SEARCH_RESULTS", os.getenv("CONFERENCE_ARXIV_SEARCH_RESULTS", "5"))),
+    )
+    abstract_sources = env_list(
+        "CONFERENCE_ABSTRACT_SOURCES",
+        ["arxiv", "semantic_scholar", "openalex", "crossref"],
+    )
+    arxiv_enrichment_enabled = "arxiv" in {source.strip().lower() for source in abstract_sources}
     stats: dict[str, Any] = {
+        "conference_abstract_enrichment_attempted": 0,
+        "conference_abstract_enrichment_succeeded": 0,
+        "conference_abstract_enrichment_skipped": 0,
+        "conference_abstract_enrichment_sources": abstract_sources,
         "conference_arxiv_enrichment_attempted": 0,
         "conference_arxiv_enrichment_succeeded": 0,
         "conference_arxiv_enrichment_skipped": 0,
@@ -1256,6 +1472,7 @@ def enrich_conference_papers_from_arxiv(papers: list[dict[str, Any]]) -> dict[st
         if paper.get("source_type") != "conference" or has_meaningful_summary(paper):
             continue
         if attempts >= max_enrichments:
+            stats["conference_abstract_enrichment_skipped"] += 1
             stats["conference_arxiv_enrichment_skipped"] += 1
             continue
         title = str(paper.get("title") or "")
@@ -1263,19 +1480,15 @@ def enrich_conference_papers_from_arxiv(papers: list[dict[str, Any]]) -> dict[st
             continue
 
         attempts += 1
-        stats["conference_arxiv_enrichment_attempted"] += 1
-        try:
-            arxiv_paper = find_arxiv_by_title(title, max_results=search_results)
-        except Exception as exc:
-            stats["conference_arxiv_enrichment_last_error"] = str(exc)
-            print(f"Warning: arXiv title enrichment failed for {paper.get('id')}: {exc}", file=sys.stderr)
-            if should_stop_arxiv_fetches(exc):
-                break
-            arxiv_paper = None
-
-        if arxiv_paper and enrich_conference_paper_from_arxiv(paper, arxiv_paper):
-            stats["conference_arxiv_enrichment_succeeded"] += 1
-            print(f"Enriched conference paper from arXiv: {paper.get('title')}", flush=True)
+        stats["conference_abstract_enrichment_attempted"] += 1
+        if arxiv_enrichment_enabled:
+            stats["conference_arxiv_enrichment_attempted"] += 1
+        candidate = find_conference_abstract_by_title(title, max_results=search_results)
+        if candidate and enrich_conference_paper_from_candidate(paper, candidate):
+            stats["conference_abstract_enrichment_succeeded"] += 1
+            if str(paper.get("abstract_source") or "").lower() == "arxiv":
+                stats["conference_arxiv_enrichment_succeeded"] += 1
+            print(f"Enriched conference paper from {paper.get('abstract_source')}: {paper.get('title')}", flush=True)
 
         if attempts < max_enrichments and delay_seconds > 0:
             time.sleep(delay_seconds)
@@ -1298,11 +1511,11 @@ def fallback_summary(paper: dict[str, Any], best_match: dict[str, Any]) -> dict[
     first_sentence = re.split(r"(?<=[.!?])\s+", abstract)[0] if abstract else ""
     if paper.get("source_type") == "conference" and not has_meaningful_summary(paper):
         return {
-            "problem": "DBLP 题录没有摘要，且未在 arXiv 找到足够可靠的同题论文摘要。",
+            "problem": "DBLP 题录没有摘要，且未在外部论文索引中找到足够可靠的同题论文摘要。",
             "method": "请打开论文链接查看方法和系统设计细节。",
             "innovation": "仅凭标题无法可靠判断创新点，已避免占用模型翻译额度。",
             "evidence": "题录信息来自会议索引，技术细节需要在原文中核验。",
-            "limitations": "DBLP 通常不提供摘要；如果作者没有在 arXiv 发布预印本，自动摘要会缺失。",
+            "limitations": "DBLP 通常不提供摘要；如果 arXiv、Semantic Scholar、OpenAlex 或 Crossref 暂未收录摘要，自动摘要会缺失。",
             "why_relevant": best_match.get("reason", "与配置方向存在文本匹配。"),
         }
     if not has_meaningful_summary(paper):
@@ -1370,7 +1583,12 @@ def call_openai_compatible(prompt: str) -> dict[str, Any]:
 def build_llm_prompt(topic: Topic, paper: dict[str, Any], base_match: dict[str, Any]) -> str:
     abstract_label = "摘要/题录信息" if paper.get("source_type") == "conference" else "摘要"
     return f"""
-请根据论文标题、摘要、分类和我的研究方向，输出精确中文分析。不要夸大摘要中没有的信息；如果证据不足，请明确说明。
+请根据论文标题、摘要、分类和我的研究方向，输出精确中文分析。目标不是逐句翻译，而是综合整篇摘要快速判断这篇论文是否值得阅读。
+要求：
+1. 先识别论文真正解决的问题、核心机制、实验或系统证据，再翻译成自然中文。
+2. 不要夸大摘要中没有的信息；如果证据不足，请明确说明。
+3. 相关性判断要严格，说明它具体匹配哪些关键词、场景或系统瓶颈。
+4. 如果论文只是泛泛相关，请把 match_level 降为 medium 或 low，并在 why_relevant 里说明需要人工复核。
 
 我的研究方向：
 名称：{topic.name}
@@ -1390,8 +1608,8 @@ arXiv 分类：{", ".join(paper.get("categories", []))}
 
 请输出 JSON，字段必须为：
 {{
-  "problem": "论文要解决的问题，中文，1-2句",
-  "method": "核心方法，中文，1-2句",
+  "problem": "论文要解决的问题，中文，1-2句，避免空泛背景",
+  "method": "核心方法，中文，2-3句，包含关键技术组件或系统流程",
   "innovation": "相对已有工作的具体创新点，中文，2-3点合并成一段",
   "evidence": "摘要中可核验的实验、理论或系统证据；没有则写证据不足",
   "limitations": "可能局限或需要阅读全文确认的点",

@@ -19,7 +19,7 @@ on:
     types: [opened, edited, reopened]
 
 permissions:
-  contents: write
+  contents: read
   pages: write
   id-token: write
   issues: read
@@ -47,6 +47,24 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Restore paper data cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .paper-cache
+          key: paper-data-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            paper-data-
+
+      - name: Hydrate cached paper data
+        run: |
+          mkdir -p web/data
+          if [ -f .paper-cache/papers.json ]; then
+            cp .paper-cache/papers.json web/data/papers.json
+          fi
+          if [ -f .paper-cache/conference_papers.json ]; then
+            cp .paper-cache/conference_papers.json web/data/conference_papers.json
+          fi
+
       - name: Collect papers
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -69,6 +87,13 @@ jobs:
           DBLP_PATTERN_DELAY_SECONDS: ${{ vars.DBLP_PATTERN_DELAY_SECONDS || '3' }}
           DBLP_RETRIES: ${{ vars.DBLP_RETRIES || '3' }}
           MAX_PER_CONFERENCE: ${{ vars.MAX_PER_CONFERENCE || '1000' }}
+          ARXIV_EXPAND_CATEGORY_SEARCH: ${{ vars.ARXIV_EXPAND_CATEGORY_SEARCH || 'true' }}
+          ARXIV_CATEGORY_MAX_RESULTS: ${{ vars.ARXIV_CATEGORY_MAX_RESULTS || vars.MAX_PER_TOPIC || '10' }}
+          ARXIV_IN_TOPIC_DELAY_SECONDS: ${{ vars.ARXIV_IN_TOPIC_DELAY_SECONDS || '3' }}
+          MAX_CONFERENCE_ABSTRACT_ENRICHMENTS: ${{ vars.MAX_CONFERENCE_ABSTRACT_ENRICHMENTS || vars.MAX_CONFERENCE_ARXIV_ENRICHMENTS || '50' }}
+          CONFERENCE_ABSTRACT_SOURCES: ${{ vars.CONFERENCE_ABSTRACT_SOURCES || 'arxiv,semantic_scholar,openalex,crossref' }}
+          CONFERENCE_ABSTRACT_DELAY_SECONDS: ${{ vars.CONFERENCE_ABSTRACT_DELAY_SECONDS || vars.CONFERENCE_ARXIV_DELAY_SECONDS || '3' }}
+          CONFERENCE_ABSTRACT_SEARCH_RESULTS: ${{ vars.CONFERENCE_ABSTRACT_SEARCH_RESULTS || vars.CONFERENCE_ARXIV_SEARCH_RESULTS || '5' }}
           MAX_CONFERENCE_ARXIV_ENRICHMENTS: ${{ vars.MAX_CONFERENCE_ARXIV_ENRICHMENTS || '50' }}
           CONFERENCE_ARXIV_DELAY_SECONDS: ${{ vars.CONFERENCE_ARXIV_DELAY_SECONDS || '3' }}
           CONFERENCE_ARXIV_SEARCH_RESULTS: ${{ vars.CONFERENCE_ARXIV_SEARCH_RESULTS || '5' }}
@@ -86,15 +111,19 @@ jobs:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: python scripts/collect_papers.py
 
-      - name: Save paper data
+      - name: Stage paper data cache
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [ -n "$(git status --porcelain -- web/data/papers.json web/data/conference_papers.json)" ]; then
-            git add web/data/papers.json web/data/conference_papers.json
-            git commit -m "Update paper data [skip ci]"
-            git push origin HEAD:main
+          mkdir -p .paper-cache
+          cp web/data/papers.json .paper-cache/papers.json
+          if [ -f web/data/conference_papers.json ]; then
+            cp web/data/conference_papers.json .paper-cache/conference_papers.json
           fi
+
+      - name: Save paper data cache
+        uses: actions/cache/save@v4
+        with:
+          path: .paper-cache
+          key: paper-data-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Setup Pages
         uses: actions/configure-pages@v5

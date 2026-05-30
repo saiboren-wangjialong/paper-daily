@@ -88,7 +88,7 @@ function dateKey(value) {
 }
 
 function collectionTime(paper) {
-  return paper.first_seen_at || paper.last_seen_at || paper.published || paper.updated || "";
+  return paper.last_seen_at || paper.first_seen_at || paper.published || paper.updated || "";
 }
 
 function startOfDay(date) {
@@ -142,6 +142,8 @@ function textIncludes(paper, query) {
     (paper.categories || []).join(" "),
     paper.best_match?.reason,
     paper.chinese_summary?.innovation,
+    paper.chinese_summary?.evidence,
+    paper.chinese_summary?.limitations,
     paper.chinese_summary?.why_relevant,
   ]
     .join(" ")
@@ -205,6 +207,8 @@ function renderPaper(paper) {
   setText(node, ".summary-problem", summary.problem);
   setText(node, ".summary-method", summary.method);
   setText(node, ".summary-innovation", summary.innovation);
+  setText(node, ".summary-evidence", summary.evidence);
+  setText(node, ".summary-limitations", summary.limitations);
   setText(node, ".summary-relevant", summary.why_relevant);
   setText(node, ".match-reason", `${best.topic_name || "未分类"}：${best.reason || ""}`);
 

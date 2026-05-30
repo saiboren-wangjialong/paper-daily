@@ -12,12 +12,14 @@ from scripts.collect_papers import (
     default_conference_years,
     enrich_conference_paper_from_arxiv,
     fetch_arxiv,
+    find_conference_abstract_by_title,
     is_relevant_enough,
     is_retryable_dblp_error,
     is_retryable_arxiv_error,
     merge_with_retained_papers,
     merge_config,
     openalex_abstract_text,
+    openalex_paper_from_work,
     parse_arxiv_entries,
     parse_conference_sources,
     parse_dblp_html_toc,
@@ -28,6 +30,7 @@ from scripts.collect_papers import (
     split_conference_payload,
     source_request_headers,
     SourceConfig,
+    semantic_scholar_paper_from_item,
     titles_match,
     Topic,
     trim_papers_for_storage,
@@ -65,6 +68,7 @@ class RetentionTest(unittest.TestCase):
         os.environ.pop("MIN_CONFERENCE_SCORE", None)
         os.environ.pop("MIN_TITLE_ONLY_SCORE", None)
         os.environ.pop("MIN_PAPER_SCORE", None)
+        os.environ.pop("CONFERENCE_ABSTRACT_SOURCES", None)
 
     def test_arxiv_retry_wait_uses_retry_after_header(self) -> None:
         os.environ["ARXIV_RETRY_MIN_SECONDS"] = "30"
@@ -248,6 +252,70 @@ class RetentionTest(unittest.TestCase):
         self.assertEqual(conference["abstract_source"], "arXiv")
         self.assertEqual(conference["paper_url"], "https://arxiv.org/abs/2601.00001")
         self.assertIn("cs.AR", conference["categories"])
+
+    def test_semantic_scholar_candidate_normalizes_abstract_source(self) -> None:
+        candidate = semantic_scholar_paper_from_item(
+            {
+                "paperId": "abc",
+                "title": "Fast Tensor Compute",
+                "abstract": "This paper presents a detailed architecture for tensor compute in LLM serving systems.",
+                "authors": [{"name": "Ada Example"}],
+                "year": 2026,
+                "url": "https://www.semanticscholar.org/paper/abc",
+                "openAccessPdf": {"url": "https://example.com/paper.pdf"},
+                "venue": "ISCA",
+                "fieldsOfStudy": ["Computer Science"],
+            }
+        )
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate["source"], "Semantic Scholar")
+        self.assertEqual(candidate["authors"], ["Ada Example"])
+        self.assertEqual(candidate["pdf_url"], "https://example.com/paper.pdf")
+        self.assertIn("ISCA", candidate["categories"])
+
+    def test_openalex_candidate_reconstructs_abstract(self) -> None:
+        candidate = openalex_paper_from_work(
+            {
+                "id": "https://openalex.org/W1",
+                "title": "Fast Tensor Compute",
+                "abstract_inverted_index": {
+                    "This": [0],
+                    "paper": [1],
+                    "studies": [2],
+                    "tensor": [3],
+                    "compute": [4],
+                },
+                "publication_year": 2026,
+                "authorships": [{"author": {"display_name": "Ada Example"}}],
+                "concepts": [{"display_name": "Computer architecture"}],
+            }
+        )
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate["source"], "OpenAlex")
+        self.assertEqual(candidate["summary"], "This paper studies tensor compute")
+
+    def test_conference_abstract_finder_tries_sources_after_arxiv_failure(self) -> None:
+        semantic_candidate = {
+            "id": "s2:abc",
+            "source": "Semantic Scholar",
+            "title": "Fast Tensor Compute",
+            "summary": "This paper presents a detailed architecture for tensor compute in LLM serving systems. " * 2,
+            "paper_url": "https://www.semanticscholar.org/paper/abc",
+            "pdf_url": "",
+            "authors": [],
+            "categories": [],
+        }
+        os.environ["CONFERENCE_ABSTRACT_SOURCES"] = "arxiv,semantic_scholar"
+
+        with (
+            mock.patch("scripts.collect_papers.find_arxiv_by_title", side_effect=TimeoutError("slow")),
+            mock.patch("scripts.collect_papers.find_semantic_scholar_by_title", return_value=semantic_candidate),
+        ):
+            candidate = find_conference_abstract_by_title("Fast Tensor Compute")
+
+        self.assertEqual(candidate, semantic_candidate)
 
     def test_relevance_filter_rejects_weak_title_only_and_conference_matches(self) -> None:
         weak_title = {"title": "A Generic Optimization Study", "summary": ""}
