@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 from __future__ import annotations
 
 import argparse
@@ -1597,7 +1597,7 @@ def call_openai_compatible(prompt: str) -> dict[str, Any]:
     api_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or ""
     base_url = os.getenv("LLM_BASE_URL", "")
     if not base_url:
-        base_url = "https://api.deepseek.com/v1" if os.getenv("DEEPSEEK_API_KEY") else "https://api.openai.com/v1"
+        base_url = "https://api.deepseek.com" if os.getenv("DEEPSEEK_API_KEY") else "https://api.openai.com/v1"
     model = os.getenv("LLM_MODEL", "deepseek-chat" if os.getenv("DEEPSEEK_API_KEY") else "gpt-4o-mini")
     endpoint = base_url.rstrip("/") + "/chat/completions"
     payload = {
